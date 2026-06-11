@@ -180,22 +180,31 @@ class P2PNode:
             return False
 
         crypto: CryptoHandler | None = session.get("crypto")
+        
+        retry = 3
 
-        try:
+        for attempt in range(retry):
 
-            packet = self.protocol_handler.create_packet(
-                PacketType.MESSAGE,
-                self.username,
-                message,
-                crypto=crypto,
-            )
-            peer_socket.sendall(self.protocol_handler.serialize(packet))
-            return True
+            try:
+                packet = self.protocol_handler.create_packet(
+                   PacketType.MESSAGE,
+                   self.username,
+                   message,
+                   crypto=crypto,
+                )
+                peer_socket.sendall(
+                    self.protocol_handler.serialize(packet)
+                )
+                return True
 
-        except (BrokenPipeError, OSError) as error:
-            print(f"[ERROR] Send failed: {error}")
-            self.remove_peer(peer_socket)
-            return False
+            except (BrokenPipeError, OSError) as error:
+
+                print(f"[WARNING] Send failed "
+                      f"({attempt + 1}/{retry}) "
+                      f"to {peer_address}: {error}"
+                )
+        self.remove_peer(peer_socket)
+        return False
 
     def receive_messages(self, peer_socket: socket.socket) -> None:
         """Receive loop — dispatches to handlers. Must never raise."""
@@ -242,6 +251,7 @@ class P2PNode:
 
     def broadcast_message(self, message: str) -> tuple[int, int]:
         """Send *message* to every active peer."""
+
         with self.peers_lock:
             active = [
                 addr
@@ -252,14 +262,32 @@ class P2PNode:
         sent = 0
         failed = 0
 
+        counter_lock = threading.lock()
+        threads = []
+
+        def send_to_peer(peer_address):
+
+            nonlocal sent, failed
+
+            success =  self.send_message(message, peer_address)
+            with counter_lock:
+                if success:
+                    sent += 1
+                else:
+                    failed += 1
+
         for peer_address in active:
-            if self.send_message(message, peer_address):
-                sent += 1
-            else:
-                failed += 1
-
+            thread = threading.Thread(
+                target=send_to_peer,
+                args=(peer_address,)
+            )
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        self.cleanup_dead_peers()
         return sent, failed
-
+    
     # Internal handlers
     def handle_handshake(self, packet: dict, peer_socket: socket.socket) -> None:
         
@@ -491,29 +519,20 @@ class P2PNode:
         return True
 
     def remove_peer(self, peer_socket: socket.socket) -> None:
-        peer_address = self.get_peer_address(peer_socket)
-        remaining_peers = 0
-
-        with self.peers_lock:
-
-            if peer_address is not None:
-                self.peers.pop(peer_address, None)
-                self.peer_sessions.pop(peer_address, None)
-                self._sock_to_addr.pop(id(peer_socket), None)
-                remaining_peers = len(self.peers)
-
-        try:
-            peer_socket.close()
-
-        except OSError:
-            pass
-
-        if peer_address is not None:
-
-            print(f"[INFO] Peer disconnected: {peer_address} — remaining: {remaining_peers}")
-
-            if self.on_disconnect is not None:
-                self.on_disconnect(peer_address)
+       """Remove disconnected peers."""
+       dead_peers = []
+       with self.peers_lock:
+           for peer_address, sock in self.peers.items():
+               try:
+                   sock.getpeername()
+               except OSError:
+                   print(
+                       f"[INFO] Dead peer found: "
+                       f"{peer_address}"
+                   )
+                   dead_peers.apend(sock)
+       for sock in dead_peers:
+               self.remove_peer(sock)
 
     def start_receive_thread(self, peer_address: str, sock: socket.socket) -> None:
         thread = threading.Thread(
